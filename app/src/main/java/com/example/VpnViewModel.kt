@@ -64,12 +64,16 @@ class VpnViewModel : ViewModel() {
     private val _refreshError = MutableStateFlow<String?>(null)
     val refreshError: StateFlow<String?> = _refreshError.asStateFlow()
 
+    private val _subscriptionInfo = MutableStateFlow<SubscriptionInfo?>(null)
+    val subscriptionInfo: StateFlow<SubscriptionInfo?> = _subscriptionInfo.asStateFlow()
+
     private var trafficMonitorJob: Job? = null
     private var lastRxBytes = 0L
 
     fun init(context: Context) {
         val savedUrl = LocalStorage.getSubscriptionUrl(context)
         val savedConfigs = LocalStorage.getConfigs(context)
+        _subscriptionInfo.value = LocalStorage.getSubscriptionInfo(context)
 
         if (!savedUrl.isNullOrEmpty() && savedConfigs.isNotEmpty()) {
             _configs.value = savedConfigs
@@ -87,7 +91,7 @@ class VpnViewModel : ViewModel() {
 
     fun loginWithSubscription(context: Context, url: String) {
         if (url.trim().isEmpty()) {
-            _loginError.value = "لطفا لینک سابسکرایب را وارد کنید"
+            _loginError.value = "لطفا کد تایید را وارد کنید"
             return
         }
 
@@ -96,27 +100,29 @@ class VpnViewModel : ViewModel() {
 
         viewModelScope.launch {
             try {
-                val parsed = withContext(Dispatchers.IO) {
-                    V2RayConfigParser.fetchAndParseSubscription(url.trim())
+                val result = withContext(Dispatchers.IO) {
+                    V2RayConfigParser.fetchAndParseSubscriptionWithResult(url.trim())
                 }
 
-                if (parsed.isEmpty()) {
-                    _loginError.value = "لینک نامعتبر است یا هیچ کانفیگی یافت نشد"
+                if (result.configs.isEmpty()) {
+                    _loginError.value = "کد تایید نامعتبر است یا هیچ کانفیگی یافت نشد"
                     _loginLoading.value = false
                     return@launch
                 }
 
                 // Store in memory & persistent storage
-                _configs.value = parsed
+                _configs.value = result.configs
+                _subscriptionInfo.value = result.subInfo
                 LocalStorage.saveSubscriptionUrl(context, url.trim())
-                LocalStorage.saveConfigs(context, parsed)
+                LocalStorage.saveConfigs(context, result.configs)
+                LocalStorage.saveSubscriptionInfo(context, result.subInfo)
 
                 // Navigate to dashboard
                 _currentScreen.value = Screen.Dashboard
                 _loginLoading.value = false
             } catch (e: Exception) {
                 Log.e("VpnViewModel", "Error fetching subscription", e)
-                _loginError.value = "لینک نامعتبر است"
+                _loginError.value = "کد تایید نامعتبر است"
                 _loginLoading.value = false
             }
         }
@@ -226,6 +232,7 @@ class VpnViewModel : ViewModel() {
         LocalStorage.clearAll(context)
         _configs.value = emptyList()
         _serverPings.value = emptyMap()
+        _subscriptionInfo.value = null
         _currentScreen.value = Screen.Login
     }
 
@@ -241,11 +248,11 @@ class VpnViewModel : ViewModel() {
 
         viewModelScope.launch {
             try {
-                val parsed = withContext(Dispatchers.IO) {
-                    V2RayConfigParser.fetchAndParseSubscription(savedUrl)
+                val result = withContext(Dispatchers.IO) {
+                    V2RayConfigParser.fetchAndParseSubscriptionWithResult(savedUrl)
                 }
 
-                if (parsed.isEmpty()) {
+                if (result.configs.isEmpty()) {
                     val errMsg = "لیست سرورها خالی است یا کانفیگی یافت نشد"
                     _refreshError.value = errMsg
                     _refreshing.value = false
@@ -253,8 +260,10 @@ class VpnViewModel : ViewModel() {
                     return@launch
                 }
 
-                _configs.value = parsed
-                LocalStorage.saveConfigs(context, parsed)
+                _configs.value = result.configs
+                _subscriptionInfo.value = result.subInfo
+                LocalStorage.saveConfigs(context, result.configs)
+                LocalStorage.saveSubscriptionInfo(context, result.subInfo)
                 _refreshing.value = false
                 onSuccess()
             } catch (e: Exception) {

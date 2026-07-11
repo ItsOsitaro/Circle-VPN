@@ -30,6 +30,7 @@ class MyVpnService : VpnService() {
 
     // User-space TCP/IP Stack fields
     private val writeLock = Any()
+    private val sessionLock = Any()
     private val udpSessions = ConcurrentHashMap<String, UdpSession>()
     private val tcpSessions = ConcurrentHashMap<String, TcpSession>()
 
@@ -183,7 +184,7 @@ class MyVpnService : VpnService() {
             )
 
             // Initialize dynamic thread pool for sessions
-            sessionExecutor = java.util.concurrent.Executors.newFixedThreadPool(150)
+            sessionExecutor = java.util.concurrent.Executors.newCachedThreadPool()
 
             // Establish the local Virtual Network Interface
             val builder = Builder()
@@ -368,78 +369,84 @@ class MyVpnService : VpnService() {
         val key = "$srcIp:$srcPort->$dstIp:$dstPort"
         var session = udpSessions[key]
         if (session == null || session.socket.isClosed) {
-            // Check session limit
-            val currentTotal = tcpSessions.size + udpSessions.size
-            if (currentTotal >= MAX_CONCURRENT_SESSIONS) {
-                VpnDiagnosticManager.addLog(
-                    type = "TUN_ROUTING_LIMIT",
-                    description = "UDP Packet Dropped",
-                    details = "Active sessions ($currentTotal) exceeded MAX_CONCURRENT_SESSIONS ($MAX_CONCURRENT_SESSIONS). Dropping UDP packet from $srcIp:$srcPort to $dstIp:$dstPort.",
-                    status = "DROPPED"
-                )
-                return
-            }
-
-            try {
-                val socket = java.net.DatagramSocket()
-                protect(socket)
-                socket.soTimeout = 5000 // 5 seconds timeout
-                
-                val newSession = UdpSession(
-                    srcIp = srcIp, srcPort = srcPort,
-                    dstIp = dstIp, dstPort = dstPort,
-                    socket = socket,
-                    lastActivity = System.currentTimeMillis()
-                )
-                udpSessions[key] = newSession
-                session = newSession
-                
-                // Submit to the executor
-                try {
-                    sessionExecutor?.execute {
-                        val originalName = Thread.currentThread().name
-                        Thread.currentThread().name = "UdpListener-$key"
-                        try {
-                            val recvBuffer = ByteArray(4096)
-                            val recvPacket = java.net.DatagramPacket(recvBuffer, recvBuffer.size)
-                            while (isRunning && !socket.isClosed) {
-                                socket.receive(recvPacket)
-                                val responsePayload = ByteArray(recvPacket.length)
-                                System.arraycopy(recvBuffer, 0, responsePayload, 0, recvPacket.length)
-                                
-                                // Build raw IP/UDP response
-                                val responsePacket = buildUdpPacket(
-                                    srcIp = dstIp,
-                                    srcPort = dstPort,
-                                    dstIp = srcIp,
-                                    dstPort = srcPort,
-                                    payload = responsePayload
-                                )
-                                
-                                synchronized(writeLock) {
-                                    outputStream.write(responsePacket)
-                                    outputStream.flush()
-                                }
-                                
-                                newSession.lastActivity = System.currentTimeMillis()
-                            }
-                        } catch (e: Exception) {
-                            // Timeout or socket closed
-                        } finally {
-                            socket.close()
-                            udpSessions.remove(key)
-                            Thread.currentThread().name = originalName
-                        }
+            synchronized(sessionLock) {
+                session = udpSessions[key]
+                if (session == null || session!!.socket.isClosed) {
+                    val currentTotal = tcpSessions.size + udpSessions.size
+                    if (currentTotal >= MAX_CONCURRENT_SESSIONS) {
+                        VpnDiagnosticManager.addLog(
+                            type = "TUN_ROUTING_LIMIT",
+                            description = "UDP Packet Dropped",
+                            details = "Active sessions ($currentTotal) exceeded MAX_CONCURRENT_SESSIONS ($MAX_CONCURRENT_SESSIONS). Dropping UDP packet from $srcIp:$srcPort to $dstIp:$dstPort.",
+                            status = "DROPPED"
+                        )
+                        return
                     }
-                } catch (e: java.util.concurrent.RejectedExecutionException) {
-                    Log.e("MyVpnService", "Rejected UDP session task for $key", e)
-                    socket.close()
-                    udpSessions.remove(key)
+
+                    try {
+                        val socket = java.net.DatagramSocket()
+                        protect(socket)
+                        socket.soTimeout = 5000 // 5 seconds timeout
+                        
+                        val newSession = UdpSession(
+                            srcIp = srcIp, srcPort = srcPort,
+                            dstIp = dstIp, dstPort = dstPort,
+                            socket = socket,
+                            lastActivity = System.currentTimeMillis()
+                        )
+                        udpSessions[key] = newSession
+                        session = newSession
+                    } catch (e: Exception) {
+                        Log.e("MyVpnService", "Failed to setup UDP session for $key", e)
+                        return
+                    }
                 }
-                
-            } catch (e: Exception) {
-                Log.e("MyVpnService", "Failed to setup UDP session for $key", e)
-                return
+            }
+            
+            val finalSession = session ?: return
+            val socket = finalSession.socket
+            
+            // Submit to the executor outside of sessionLock
+            try {
+                sessionExecutor?.execute {
+                    val originalName = Thread.currentThread().name
+                    Thread.currentThread().name = "UdpListener-$key"
+                    try {
+                        val recvBuffer = ByteArray(4096)
+                        val recvPacket = java.net.DatagramPacket(recvBuffer, recvBuffer.size)
+                        while (isRunning && !socket.isClosed) {
+                            socket.receive(recvPacket)
+                            val responsePayload = ByteArray(recvPacket.length)
+                            System.arraycopy(recvBuffer, 0, responsePayload, 0, recvPacket.length)
+                            
+                            // Build raw IP/UDP response
+                            val responsePacket = buildUdpPacket(
+                                srcIp = dstIp,
+                                srcPort = dstPort,
+                                dstIp = srcIp,
+                                dstPort = srcPort,
+                                payload = responsePayload
+                            )
+                            
+                            synchronized(writeLock) {
+                                outputStream.write(responsePacket)
+                                outputStream.flush()
+                            }
+                            
+                            finalSession.lastActivity = System.currentTimeMillis()
+                        }
+                    } catch (e: Exception) {
+                        // Timeout or socket closed
+                    } finally {
+                        socket.close()
+                        udpSessions.remove(key)
+                        Thread.currentThread().name = originalName
+                    }
+                }
+            } catch (e: java.util.concurrent.RejectedExecutionException) {
+                Log.e("MyVpnService", "Rejected UDP session task for $key", e)
+                socket.close()
+                udpSessions.remove(key)
             }
         }
         
@@ -471,66 +478,84 @@ class MyVpnService : VpnService() {
         var session = tcpSessions[key]
         
         if (isSyn) {
-            // Clean up old session if any
-            session?.let {
-                try { it.socket?.close() } catch (e: Exception) {}
-                tcpSessions.remove(key)
-            }
-            
-            // Check session limit
-            val currentTotal = tcpSessions.size + udpSessions.size
-            if (currentTotal >= MAX_CONCURRENT_SESSIONS) {
-                VpnDiagnosticManager.addLog(
-                    type = "TUN_ROUTING_LIMIT",
-                    description = "TCP Connection Rejected",
-                    details = "Active sessions ($currentTotal) exceeded MAX_CONCURRENT_SESSIONS ($MAX_CONCURRENT_SESSIONS). Rejecting TCP from $srcIp:$srcPort to $dstIp:$dstPort.",
-                    status = "DROPPED"
-                )
+            var rejected = false
+            var rstPacket: ByteArray? = null
+            var responsePacket: ByteArray? = null
+            var newSession: TcpSession? = null
+
+            synchronized(sessionLock) {
+                // Clean up old session if any
+                session?.let {
+                    try { it.socket?.close() } catch (e: Exception) {}
+                    tcpSessions.remove(key)
+                }
                 
-                // Immediately send a RST back
-                val rstPacket = buildTcpPacket(
-                    srcIp = dstIp, srcPort = dstPort,
-                    dstIp = srcIp, dstPort = srcPort,
-                    seq = 0L,
-                    ack = seq + 1,
-                    flags = 0x14 // RST | ACK
-                )
-                synchronized(writeLock) {
-                    try {
-                        outputStream.write(rstPacket)
-                        outputStream.flush()
-                    } catch (e: Exception) {}
+                // Check session limit
+                val currentTotal = tcpSessions.size + udpSessions.size
+                if (currentTotal >= MAX_CONCURRENT_SESSIONS) {
+                    VpnDiagnosticManager.addLog(
+                        type = "TUN_ROUTING_LIMIT",
+                        description = "TCP Connection Rejected",
+                        details = "Active sessions ($currentTotal) exceeded MAX_CONCURRENT_SESSIONS ($MAX_CONCURRENT_SESSIONS). Rejecting TCP from $srcIp:$srcPort to $dstIp:$dstPort.",
+                        status = "DROPPED"
+                    )
+                    
+                    // Immediately build a RST back
+                    rstPacket = buildTcpPacket(
+                        srcIp = dstIp, srcPort = dstPort,
+                        dstIp = srcIp, dstPort = srcPort,
+                        seq = 0L,
+                        ack = seq + 1,
+                        flags = 0x14 // RST | ACK
+                    )
+                    rejected = true
+                } else {
+                    // Respond SYN-ACK immediately to establish local TCP connection
+                    val initialServerSeq = (0L..100000L).random()
+                    responsePacket = buildTcpPacket(
+                        srcIp = dstIp, srcPort = dstPort,
+                        dstIp = srcIp, dstPort = srcPort,
+                        seq = initialServerSeq,
+                        ack = seq + 1,
+                        flags = 0x12 // SYN | ACK
+                    )
+                    
+                    newSession = TcpSession(
+                        srcIp = srcIp, srcPort = srcPort,
+                        dstIp = dstIp, dstPort = dstPort,
+                        clientSeq = seq + 1,
+                        serverSeq = initialServerSeq + 1,
+                        socket = null,
+                        lastActivity = System.currentTimeMillis(),
+                        state = TcpState.SYN_RECEIVED
+                    )
+                    tcpSessions[key] = newSession!!
+                }
+            }
+
+            if (rejected) {
+                rstPacket?.let { packet ->
+                    synchronized(writeLock) {
+                        try {
+                            outputStream.write(packet)
+                            outputStream.flush()
+                        } catch (e: Exception) {}
+                    }
                 }
                 return
             }
 
-            // Respond SYN-ACK immediately to establish local TCP connection
-            val initialServerSeq = (0L..100000L).random()
-            val responsePacket = buildTcpPacket(
-                srcIp = dstIp, srcPort = dstPort,
-                dstIp = srcIp, dstPort = srcPort,
-                seq = initialServerSeq,
-                ack = seq + 1,
-                flags = 0x12 // SYN | ACK
-            )
-            
-            synchronized(writeLock) {
-                try {
-                    outputStream.write(responsePacket)
-                    outputStream.flush()
-                } catch (e: Exception) {}
+            // Write SYN-ACK
+            responsePacket?.let { packet ->
+                synchronized(writeLock) {
+                    try {
+                        outputStream.write(packet)
+                        outputStream.flush()
+                    } catch (e: Exception) {}
+                }
             }
-            
-            val newSession = TcpSession(
-                srcIp = srcIp, srcPort = srcPort,
-                dstIp = dstIp, dstPort = dstPort,
-                clientSeq = seq + 1,
-                serverSeq = initialServerSeq + 1,
-                socket = null,
-                lastActivity = System.currentTimeMillis(),
-                state = TcpState.SYN_RECEIVED
-            )
-            tcpSessions[key] = newSession
+
+            val finalSession = newSession ?: return
             
             // Connect to the remote server via V2Ray tunnel in background using executor
             try {
@@ -541,8 +566,8 @@ class MyVpnService : VpnService() {
                         // Reuse proxy configuration from proxyServer inside MyVpnService
                         val proxy = proxyServer ?: throw Exception("Proxy server not initialized")
                         val clientSocket = proxy.connectToRemoteProxyTunnel(dstIp, dstPort)
-                        newSession.socket = clientSocket
-                        newSession.state = TcpState.ESTABLISHED
+                        finalSession.socket = clientSocket
+                        finalSession.state = TcpState.ESTABLISHED
                         
                         VpnDiagnosticManager.addLog(
                             type = "TUN_ROUTING",
@@ -554,7 +579,7 @@ class MyVpnService : VpnService() {
                         // Read from remote socket and write to TUN
                         val input = clientSocket.getInputStream()
                         val buffer = ByteArray(16384)
-                        while (isRunning && newSession.state == TcpState.ESTABLISHED && !clientSocket.isClosed) {
+                        while (isRunning && finalSession.state == TcpState.ESTABLISHED && !clientSocket.isClosed) {
                             val readBytes = input.read(buffer)
                             if (readBytes == -1) break
                             if (readBytes > 0) {
@@ -564,8 +589,8 @@ class MyVpnService : VpnService() {
                                 val dataPacket = buildTcpPacket(
                                     srcIp = dstIp, srcPort = dstPort,
                                     dstIp = srcIp, dstPort = srcPort,
-                                    seq = newSession.serverSeq,
-                                    ack = newSession.clientSeq,
+                                    seq = finalSession.serverSeq,
+                                    ack = finalSession.clientSeq,
                                     flags = 0x18, // PSH | ACK
                                     payload = data
                                 )
@@ -575,8 +600,8 @@ class MyVpnService : VpnService() {
                                     outputStream.flush()
                                 }
                                 
-                                newSession.serverSeq += readBytes
-                                newSession.lastActivity = System.currentTimeMillis()
+                                finalSession.serverSeq += readBytes
+                                finalSession.lastActivity = System.currentTimeMillis()
                             }
                         }
                     } catch (e: Exception) {
@@ -1027,7 +1052,12 @@ class MyVpnService : VpnService() {
             Log.e("MyVpnService", "Error closing VPN interface", e)
         }
 
-        stopForeground(true)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        } else {
+            @Suppress("DEPRECATION")
+            stopForeground(true)
+        }
         stopSelf()
     }
 
