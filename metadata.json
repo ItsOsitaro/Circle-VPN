@@ -1,5 +1,5 @@
 {
-  "name": "V2Tunnel",
+  "name": "Circle VPN",
   "description": "A high-performance Android VPN client supporting V2Ray subscription management, real-time background latency testing, and live graphical ping tracking.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]

@@ -58,6 +58,12 @@ class VpnViewModel : ViewModel() {
     private val _speedHistory = MutableStateFlow<List<Float>>(List(20) { 0f })
     val speedHistory: StateFlow<List<Float>> = _speedHistory.asStateFlow()
 
+    private val _refreshing = MutableStateFlow(false)
+    val refreshing: StateFlow<Boolean> = _refreshing.asStateFlow()
+
+    private val _refreshError = MutableStateFlow<String?>(null)
+    val refreshError: StateFlow<String?> = _refreshError.asStateFlow()
+
     private var trafficMonitorJob: Job? = null
     private var lastRxBytes = 0L
 
@@ -151,10 +157,34 @@ class VpnViewModel : ViewModel() {
             _livePing.value = if (activePing > 0) activePing else 120
 
             // Step 3: Trigger Android VpnService
+            // Securely resolve the server domain name to its IP address before turning on the VPN
+            // This prevents DNS resolution failures or hijacking once the VPN routes capture everything.
+            val resolvedHost = try {
+                withContext(Dispatchers.IO) {
+                    java.net.InetAddress.getByName(bestConfig.address).hostAddress
+                }
+            } catch (e: Exception) {
+                Log.e("VpnViewModel", "Failed to resolve server host ${bestConfig.address}, using original address", e)
+                bestConfig.address
+            }
+
+            val originalSni = bestConfig.sni
+            val resolvedSni = if (originalSni.isNullOrEmpty()) {
+                bestConfig.address // Fallback to original domain name for SNI/TLS handshakes
+            } else {
+                originalSni
+            }
+
             val intent = Intent(context, MyVpnService::class.java).apply {
                 action = MyVpnService.ACTION_CONNECT
                 putExtra(MyVpnService.EXTRA_SERVER_NAME, bestConfig.remarks)
-                putExtra(MyVpnService.EXTRA_SERVER_HOST, bestConfig.address)
+                putExtra(MyVpnService.EXTRA_SERVER_HOST, resolvedHost)
+                putExtra("server_port", bestConfig.port)
+                putExtra("server_protocol", bestConfig.protocol)
+                putExtra("server_uuid", bestConfig.uuidOrPassword)
+                putExtra("server_tls", bestConfig.tls)
+                putExtra("server_sni", resolvedSni)
+                putExtra("server_method", bestConfig.method)
             }
             
             try {
@@ -186,6 +216,44 @@ class VpnViewModel : ViewModel() {
         _configs.value = emptyList()
         _serverPings.value = emptyMap()
         _currentScreen.value = Screen.Login
+    }
+
+    fun refreshSubscription(context: Context, onSuccess: () -> Unit = {}, onFailure: (String) -> Unit = {}) {
+        val savedUrl = LocalStorage.getSubscriptionUrl(context)
+        if (savedUrl.isNullOrEmpty()) {
+            onFailure("لینکی برای بروزرسانی ذخیره نشده است")
+            return
+        }
+
+        _refreshing.value = true
+        _refreshError.value = null
+
+        viewModelScope.launch {
+            try {
+                val parsed = withContext(Dispatchers.IO) {
+                    V2RayConfigParser.fetchAndParseSubscription(savedUrl)
+                }
+
+                if (parsed.isEmpty()) {
+                    val errMsg = "لیست سرورها خالی است یا کانفیگی یافت نشد"
+                    _refreshError.value = errMsg
+                    _refreshing.value = false
+                    onFailure(errMsg)
+                    return@launch
+                }
+
+                _configs.value = parsed
+                LocalStorage.saveConfigs(context, parsed)
+                _refreshing.value = false
+                onSuccess()
+            } catch (e: Exception) {
+                Log.e("VpnViewModel", "Error refreshing subscription", e)
+                val errMsg = "بروزرسانی ناموفق بود"
+                _refreshError.value = errMsg
+                _refreshing.value = false
+                onFailure(errMsg)
+            }
+        }
     }
 
     private fun startTrafficMonitoring(context: Context) {
