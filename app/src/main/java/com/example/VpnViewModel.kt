@@ -142,13 +142,24 @@ class VpnViewModel : ViewModel() {
             _serverPings.value = pings
 
             // Step 2: Find the config with lowest ping (which is > 0)
-            val bestConfig = _configs.value
+            // Only VLESS and Trojan are supported in the pure-Java proxy tunnel
+            val supportedConfigs = _configs.value.filter { 
+                it.protocol.lowercase() == "vless" || it.protocol.lowercase() == "trojan" 
+            }
+            
+            val bestConfig = supportedConfigs
                 .filter { (pings[it.rawUri] ?: -1) > 0 }
                 .minByOrNull { pings[it.rawUri] ?: Int.MAX_VALUE }
-                ?: _configs.value.firstOrNull() // fallback
+                ?: supportedConfigs.firstOrNull() // fallback
 
             if (bestConfig == null) {
                 _vpnStatus.value = VpnStatus.DISCONNECTED
+                VpnDiagnosticManager.addLog(
+                    type = "SYSTEM_ERROR",
+                    description = "No Supported Server",
+                    details = "Could not find any working VLESS or Trojan servers. VMess and Shadowsocks are not supported by the local Java proxy.",
+                    status = "FAILED"
+                )
                 return@launch
             }
 

@@ -133,15 +133,14 @@ class MyVpnService : VpnService() {
             val builder = Builder()
                 .setSession("Circle VPN")
                 .addAddress("10.0.0.2", 24)
-                .addRoute("0.0.0.0", 0) // Route all traffic to the TUN interface to make the HTTP proxy default
-                .addRoute("::", 0)       // Route all IPv6 traffic to the TUN interface
+                .addRoute("10.0.0.0", 24) // Route only the local VPN subnet
                 .allowBypass()
 
             VpnDiagnosticManager.addLog(
                 type = "SYSTEM",
-                description = "Default Routing Active",
-                details = "VPN route configured for 0.0.0.0/0 (all traffic). System HTTP proxy configuration will direct compatible app traffic here.",
-                status = "TUNNELED"
+                description = "VPN Route Configuration",
+                details = "VPN route configured for 10.0.0.0/24 subnet. System HTTP proxy configuration will direct compatible app traffic here.",
+                status = "INFO"
             )
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
