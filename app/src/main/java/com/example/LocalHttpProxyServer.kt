@@ -291,7 +291,7 @@ class LocalHttpProxyServer(
         return sslContext.socketFactory
     }
 
-    private fun connectToRemoteProxyTunnel(targetHost: String, targetPort: Int): Socket {
+    fun connectToRemoteProxyTunnel(targetHost: String, targetPort: Int): Socket {
         val rawSocket = Socket()
         MyVpnService.protectSocket(rawSocket)
         rawSocket.connect(InetSocketAddress(serverHost, serverPort), 10000)
