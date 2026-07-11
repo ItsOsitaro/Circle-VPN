@@ -483,10 +483,10 @@ class LocalHttpProxyServer(
         val sb = StringBuilder()
         var c: Int
         while (input.read().also { c = it } != -1) {
-            if (c == '\n'.toInt()) {
+            if (c == '\n'.code) {
                 break
             }
-            if (c == '\r'.toInt()) {
+            if (c == '\r'.code) {
                 continue
             }
             sb.append(c.toChar())
